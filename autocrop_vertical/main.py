@@ -12,7 +12,7 @@ import numpy as np
 from tqdm import tqdm
 
 # --- Constants ---
-ASPECT_RATIO = 9 / 16
+ASPECT_RATIO = 10 / 16
 
 # Load the YOLO model once
 model = YOLO('yolov8n.pt')
