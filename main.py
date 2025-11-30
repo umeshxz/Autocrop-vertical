@@ -47,8 +47,10 @@ def analyze_scene_content(video_path, scene_start_time, scene_end_time):
     detected_objects = []
 
     for result in results:
+        if len(detected_objects) >= 1: return detected_objects
         boxes = result.boxes
         for box in boxes:
+            if len(detected_objects) >= 1: return detected_objects
             if box.cls[0] == 0:
                 x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
                 person_box = [x1, y1, x2, y2]
@@ -129,16 +131,11 @@ def get_video_resolution(video_path):
     cap.release()
     return width, height
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Smartly crops a horizontal video into a vertical one.")
-    parser.add_argument('-i', '--input', type=str, required=True, help="Path to the input video file.")
-    parser.add_argument('-o', '--output', type=str, required=True, help="Path to the output video file.")
-    args = parser.parse_args()
-
+def run_conversion(input_path, output_path):
     script_start_time = time.time()
 
-    input_video = args.input
-    final_output_video = args.output
+    input_video = input_path
+    final_output_video = output_path
     
     # Define temporary file paths based on the output name
     base_name = os.path.splitext(final_output_video)[0]
@@ -292,3 +289,13 @@ if __name__ == '__main__':
     script_end_time = time.time()
     print(f"\n🎉 All done! Final video saved to {final_output_video}")
     print(f"⏱️  Total execution time: {script_end_time - script_start_time:.2f} seconds.")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Smartly crops a horizontal video into a vertical one.")
+    parser.add_argument('-i', '--input', type=str, required=True, help="Path to the input video file.")
+    parser.add_argument('-o', '--output', type=str, required=True, help="Path to the output video file.")
+    args = parser.parse_args()
+
+    input_v = args.input
+    final_output = args.output
+    run_conversion(input_v, final_output)
