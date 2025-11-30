@@ -1,0 +1,18 @@
+[project]
+name = "autocrop_vertical"
+version = "0.1.0"
+description = "Video converter that crops and converts horizontal to vertical videos."
+requires-python = ">=3.8"
+
+dependencies = [
+    "opencv-python",
+    "scenedetect[opencv]",
+    "ultralytics",
+    "torch",
+    "torchvision",
+    "tqdm"
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
