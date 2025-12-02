@@ -171,7 +171,7 @@ def run_conversion(input_path, output_path):
         OUTPUT_WIDTH += 1
 
     scenes_analysis = []
-    for i, (start_time, end_time) in enumerate(tqdm(scenes, desc="Analyzing Scenes")):
+    for i, (start_time, end_time) in enumerate(tqdm(scenes, desc="Analyzing Scenes", disable=True)):
         analysis = analyze_scene_content(input_video, start_time, end_time)
         strategy, target_box = decide_cropping_strategy(analysis, original_height)
         scenes_analysis.append({
@@ -291,11 +291,11 @@ def run_conversion(input_path, output_path):
     print(f"⏱️  Total execution time: {script_end_time - script_start_time:.2f} seconds.")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Smartly crops a horizontal video into a vertical one.")
-    parser.add_argument('-i', '--input', type=str, required=True, help="Path to the input video file.")
-    parser.add_argument('-o', '--output', type=str, required=True, help="Path to the output video file.")
-    args = parser.parse_args()
-
-    input_v = args.input
-    final_output = args.output
-    run_conversion(input_v, final_output)
+    # parser = argparse.ArgumentParser(description="Smartly crops a horizontal video into a vertical one.")
+    # parser.add_argument('-i', '--input', type=str, required=True, help="Path to the input video file.")
+    # parser.add_argument('-o', '--output', type=str, required=True, help="Path to the output video file.")
+    # args = parser.parse_args()
+    #
+    # input_v = args.input
+    # final_output = args.output
+    run_conversion('/Users/umeshyadav/Downloads/test.mp4', '/Users/umeshyadav/Downloads/test_1.mp4')
