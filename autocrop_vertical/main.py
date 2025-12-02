@@ -190,13 +190,13 @@ def run_conversion(input_path, output_path):
         strategy = scene_data['strategy']
         start_time = scenes[i][0].get_timecode()
         end_time = scenes[i][1].get_timecode()
-        print(f"  - Scene {i+1} ({start_time} -> {end_time}): Found {num_people} person(s). Strategy: {strategy}")
+        # print(f"  - Scene {i+1} ({start_time} -> {end_time}): Found {num_people} person(s). Strategy: {strategy}")
 
     print("\n✂️ Step 4: Processing video frames...")
     step_start_time = time.time()
     
     command = [
-        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        'ffmpeg', '-loglevel', 'info', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
         '-r', str(fps), '-i', '-', '-c:v', 'libx264',
         '-preset', 'fast', '-crf', '23', '-an', temp_video_output
@@ -210,7 +210,7 @@ def run_conversion(input_path, output_path):
     frame_number = 0
     current_scene_index = 0
     
-    with tqdm(total=total_frames, desc="Applying Plan") as pbar:
+    with tqdm(total=total_frames, desc="Applying Plan", disable=True) as pbar:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
