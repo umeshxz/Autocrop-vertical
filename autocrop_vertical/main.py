@@ -106,20 +106,22 @@ def decide_cropping_strategy(scene_analysis, frame_height):
     else:
         return 'LETTERBOX', None
 
-def calculate_crop_box(target_box, frame_width, frame_height, pan_direction=None):
+def calculate_crop_box(target_box, frame_width, frame_height, pan_direction='center'):
     target_center_x = (target_box[0] + target_box[2]) / 2
     crop_height = frame_height
     crop_width = int(crop_height * ASPECT_RATIO)
 
-    # Default centered position
-    x1 = int(target_center_x - crop_width / 2)
-
-    if pan_direction == 'right':
-        # Place subject on the left third of the frame
-        x1 = int(target_center_x - crop_width / 3)
-    elif pan_direction == 'left':
+    x1 = 0
+    if pan_direction == 'left':
         # Place subject on the right third of the frame
         x1 = int(target_center_x - (2 * crop_width / 3))
+    elif pan_direction == 'right':
+        # Place subject on the left third of the frame
+        x1 = int(target_center_x - crop_width / 3)
+    else: # 'center'
+        # Default centered position
+        x1 = int(target_center_x - crop_width / 2)
+
 
     # Boundary checks to ensure the crop box is within the frame
     if x1 < 0:
@@ -221,7 +223,7 @@ def run_conversion(input_path, output_path):
     frame_number = 0
     current_scene_index = 0
     last_pan_time = 0
-    current_pan_direction = 'left'
+    pan_state = 'center'
 
     with tqdm(total=total_frames, desc="Applying Plan", disable=True) as pbar:
         while cap.isOpened():
@@ -233,7 +235,7 @@ def run_conversion(input_path, output_path):
                frame_number >= scenes_analysis[current_scene_index + 1]['start_frame']:
                 current_scene_index += 1
                 last_pan_time = frame_number / fps
-                current_pan_direction = 'left'
+                pan_state = 'center'
 
             scene_data = scenes_analysis[current_scene_index]
             strategy = scene_data['strategy']
@@ -242,10 +244,15 @@ def run_conversion(input_path, output_path):
             if strategy == 'TRACK':
                 current_time = frame_number / fps
                 if current_time - last_pan_time > 3:
-                    current_pan_direction = 'right' if current_pan_direction == 'left' else 'left'
+                    if pan_state == 'center':
+                        pan_state = 'right'
+                    elif pan_state == 'right':
+                        pan_state = 'left'
+                    else: # pan_state == 'left'
+                        pan_state = 'right'
                     last_pan_time = current_time
 
-                crop_box = calculate_crop_box(target_box, original_width, original_height, pan_direction=current_pan_direction)
+                crop_box = calculate_crop_box(target_box, original_width, original_height, pan_direction=pan_state)
                 processed_frame = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
                 output_frame = cv2.resize(processed_frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
             else: # LETTERBOX
