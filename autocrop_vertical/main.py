@@ -154,18 +154,6 @@ def get_video_resolution(video_path):
     cap.release()
     return width, height
 
-def detect_person_in_frame(frame):
-    """
-    Detects a person in a single frame and returns the bounding box.
-    """
-    results = model([frame], verbose=False)
-    for result in results:
-        boxes = result.boxes
-        for box in boxes:
-            if box.cls[0] == 0:  # Person class
-                return [int(i) for i in box.xyxy[0]]
-    return None
-
 def run_conversion(input_path, output_path):
     script_start_time = time.time()
 
@@ -209,12 +197,17 @@ def run_conversion(input_path, output_path):
     for i, (start_time, end_time) in enumerate(tqdm(scenes, desc="Analyzing Scenes", disable=True)):
         analysis = analyze_scene_content(input_video, start_time, end_time)
         strategy, target_box = decide_cropping_strategy(analysis, original_height)
+
+        scene_duration = (end_time.get_frames() - start_time.get_frames()) / fps
+        needs_panning = strategy == 'TRACK' and scene_duration > 3
+
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
             'end_frame': end_time.get_frames(),
             'analysis': analysis,
             'strategy': strategy,
-            'target_box': target_box
+            'target_box': target_box,
+            'needs_panning': needs_panning
         })
     step_end_time = time.time()
     print(f"✅ Scene analysis complete in {step_end_time - step_start_time:.2f}s.")
@@ -245,10 +238,8 @@ def run_conversion(input_path, output_path):
     frame_number = 0
     current_scene_index = 0
     
-    # State variables for panning
-    person_in_frame_start_time = None
-    last_pan_time = None
-    pan_state = 'center' # 'center', 'left', 'right'
+    pan_state = 'center'
+    last_pan_time = 0
     last_crop_box = None
 
     with tqdm(total=total_frames, desc="Applying Plan", disable=True) as pbar:
@@ -260,51 +251,31 @@ def run_conversion(input_path, output_path):
             if current_scene_index < len(scenes_analysis) - 1 and \
                frame_number >= scenes_analysis[current_scene_index + 1]['start_frame']:
                 current_scene_index += 1
-                person_in_frame_start_time = None
                 pan_state = 'center'
-
+                last_pan_time = 0
+                last_crop_box = None
 
             scene_data = scenes_analysis[current_scene_index]
             strategy = scene_data['strategy']
             target_box = scene_data['target_box']
 
-            current_time = frame_number / fps
             if strategy == 'TRACK':
-                person_box = detect_person_in_frame(frame)
-
-                if person_box:
-                    if person_in_frame_start_time is None:
-                        person_in_frame_start_time = current_time
-                    if last_pan_time is None:
-                        last_pan_time = current_time
-
-                    time_since_person_appeared = current_time - person_in_frame_start_time
-                    time_since_last_pan = current_time - last_pan_time
-
-                    if time_since_person_appeared > 3 and time_since_last_pan > 3:
+                if scene_data['needs_panning']:
+                    scene_time = (frame_number - scene_data['start_frame']) / fps
+                    if scene_time > last_pan_time + 3:
                         if pan_state == 'center':
                             pan_state = 'right'
                         elif pan_state == 'right':
                             pan_state = 'left'
-                        elif pan_state == 'left':
+                        else: # left
                             pan_state = 'right'
-                        last_pan_time = current_time
-                    target_box = person_box
-                else:
-                    person_in_frame_start_time = None
+                        last_pan_time = scene_time
 
-                if target_box:
-                    crop_box = calculate_panning_crop_box(target_box, pan_state, last_crop_box, original_width, original_height)
-                    last_crop_box = crop_box
-                    processed_frame = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
-                    output_frame = cv2.resize(processed_frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
-                else:
-                    strategy = 'LETTERBOX'
-
-            if strategy == 'LETTERBOX':
-                person_in_frame_start_time = None
-                pan_state = 'center'
-                last_crop_box = None
+                crop_box = calculate_panning_crop_box(target_box, pan_state, last_crop_box, original_width, original_height)
+                last_crop_box = crop_box
+                processed_frame = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
+                output_frame = cv2.resize(processed_frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+            else: # LETTERBOX
                 scale_factor = OUTPUT_WIDTH / original_width
                 scaled_height = int(original_height * scale_factor)
                 scaled_frame = cv2.resize(frame, (OUTPUT_WIDTH, scaled_height))
