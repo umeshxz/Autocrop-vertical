@@ -122,6 +122,29 @@ def calculate_crop_box(target_box, frame_width, frame_height):
         x1 = frame_width - crop_width
     return x1, y1, x2, y2
 
+def calculate_panning_crop_box(target_box, pan_state, last_crop_box, frame_width, frame_height):
+    crop_height = frame_height
+    crop_width = int(crop_height * ASPECT_RATIO)
+
+    if pan_state == 'center' or not last_crop_box:
+        return calculate_crop_box(target_box, frame_width, frame_height)
+
+    last_x1, _, last_x2, _ = last_crop_box
+
+    if pan_state == 'right':
+        x1 = last_x2 + 1
+        x2 = x1 + crop_width
+        if x2 > frame_width:
+            x2 = frame_width
+            x1 = x2 - crop_width
+    elif pan_state == 'left':
+        x1 = last_x1 - crop_width - 1
+        if x1 < 0:
+            x1 = 0
+        x2 = x1 + crop_width
+
+    return x1, 0, x2, crop_height
+
 def get_video_resolution(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -174,12 +197,17 @@ def run_conversion(input_path, output_path):
     for i, (start_time, end_time) in enumerate(tqdm(scenes, desc="Analyzing Scenes", disable=True)):
         analysis = analyze_scene_content(input_video, start_time, end_time)
         strategy, target_box = decide_cropping_strategy(analysis, original_height)
+
+        scene_duration = (end_time.get_frames() - start_time.get_frames()) / fps
+        needs_panning = strategy == 'TRACK' and scene_duration > 3
+
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
             'end_frame': end_time.get_frames(),
             'analysis': analysis,
             'strategy': strategy,
-            'target_box': target_box
+            'target_box': target_box,
+            'needs_panning': needs_panning
         })
     step_end_time = time.time()
     print(f"✅ Scene analysis complete in {step_end_time - step_start_time:.2f}s.")
@@ -210,6 +238,10 @@ def run_conversion(input_path, output_path):
     frame_number = 0
     current_scene_index = 0
     
+    pan_state = 'center'
+    last_pan_time = 0
+    last_crop_box = None
+
     with tqdm(total=total_frames, desc="Applying Plan", disable=True) as pbar:
         while cap.isOpened():
             ret, frame = cap.read()
@@ -219,13 +251,28 @@ def run_conversion(input_path, output_path):
             if current_scene_index < len(scenes_analysis) - 1 and \
                frame_number >= scenes_analysis[current_scene_index + 1]['start_frame']:
                 current_scene_index += 1
+                pan_state = 'center'
+                last_pan_time = 0
+                last_crop_box = None
 
             scene_data = scenes_analysis[current_scene_index]
             strategy = scene_data['strategy']
             target_box = scene_data['target_box']
 
             if strategy == 'TRACK':
-                crop_box = calculate_crop_box(target_box, original_width, original_height)
+                if scene_data['needs_panning']:
+                    scene_time = (frame_number - scene_data['start_frame']) / fps
+                    if scene_time > last_pan_time + 3:
+                        if pan_state == 'center':
+                            pan_state = 'right'
+                        elif pan_state == 'right':
+                            pan_state = 'left'
+                        else: # left
+                            pan_state = 'right'
+                        last_pan_time = scene_time
+
+                crop_box = calculate_panning_crop_box(target_box, pan_state, last_crop_box, original_width, original_height)
+                last_crop_box = crop_box
                 processed_frame = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
                 output_frame = cv2.resize(processed_frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
             else: # LETTERBOX
