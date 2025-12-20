@@ -1,18 +1,21 @@
-import time
-import cv2
-import scenedetect
-import subprocess
 import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
-from ultralytics import YOLO
-import torch
-import os
-import numpy as np
 from tqdm import tqdm
+from ultralytics import YOLO
 
 # --- Constants ---
-ASPECT_RATIO = 10 / 16
+ASPECT_RATIO = 10/16
 
 # Load the YOLO model once
 model = YOLO('yolov8n.pt')
@@ -90,7 +93,7 @@ def get_enclosing_box(boxes):
     max_y = max(box[3] for box in boxes)
     return [min_x, min_y, max_x, max_y]
 
-def decide_cropping_strategy(scene_analysis, frame_height):
+def decide_cropping_strategy(scene_analysis, frame_height, aspect_ratio=ASPECT_RATIO):
     num_people = len(scene_analysis)
     if num_people == 0:
         return 'LETTERBOX', None
@@ -100,16 +103,16 @@ def decide_cropping_strategy(scene_analysis, frame_height):
     person_boxes = [obj['person_box'] for obj in scene_analysis]
     group_box = get_enclosing_box(person_boxes)
     group_width = group_box[2] - group_box[0]
-    max_width_for_crop = frame_height * ASPECT_RATIO
+    max_width_for_crop = frame_height * aspect_ratio
     if group_width < max_width_for_crop:
         return 'TRACK', group_box
     else:
         return 'LETTERBOX', None
 
-def calculate_crop_box(target_box, frame_width, frame_height):
+def calculate_crop_box(target_box, frame_width, frame_height, aspect_ratio=ASPECT_RATIO):
     target_center_x = (target_box[0] + target_box[2]) / 2
     crop_height = frame_height
-    crop_width = int(crop_height * ASPECT_RATIO)
+    crop_width = int(crop_height * aspect_ratio)
     x1 = int(target_center_x - crop_width / 2)
     y1 = 0
     x2 = int(target_center_x + crop_width / 2)
@@ -122,6 +125,29 @@ def calculate_crop_box(target_box, frame_width, frame_height):
         x1 = frame_width - crop_width
     return x1, y1, x2, y2
 
+def calculate_panning_crop_box(target_box, pan_state, last_crop_box, frame_width, frame_height, aspect_ratio=ASPECT_RATIO):
+    crop_height = frame_height
+    crop_width = int(crop_height * aspect_ratio)
+
+    if pan_state == 'center' or not last_crop_box:
+        return calculate_crop_box(target_box, frame_width, frame_height)
+
+    last_x1, _, last_x2, _ = last_crop_box
+
+    if pan_state == 'right':
+        x1 = last_x2 + 1
+        x2 = x1 + crop_width
+        if x2 > frame_width:
+            x2 = frame_width
+            x1 = x2 - crop_width
+    elif pan_state == 'left':
+        x1 = last_x1 - crop_width - 1
+        if x1 < 0:
+            x1 = 0
+        x2 = x1 + crop_width
+
+    return x1, 0, x2, crop_height
+
 def get_video_resolution(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -131,7 +157,7 @@ def get_video_resolution(video_path):
     cap.release()
     return width, height
 
-def run_conversion(input_path, output_path):
+def run_conversion(input_path, output_path, aspect_ratio=ASPECT_RATIO):
     script_start_time = time.time()
 
     input_video = input_path
@@ -166,7 +192,7 @@ def run_conversion(input_path, output_path):
     original_width, original_height = get_video_resolution(input_video)
     
     OUTPUT_HEIGHT = original_height
-    OUTPUT_WIDTH = int(OUTPUT_HEIGHT * ASPECT_RATIO)
+    OUTPUT_WIDTH = int(OUTPUT_HEIGHT * aspect_ratio)
     if OUTPUT_WIDTH % 2 != 0:
         OUTPUT_WIDTH += 1
 
@@ -174,12 +200,17 @@ def run_conversion(input_path, output_path):
     for i, (start_time, end_time) in enumerate(tqdm(scenes, desc="Analyzing Scenes", disable=True)):
         analysis = analyze_scene_content(input_video, start_time, end_time)
         strategy, target_box = decide_cropping_strategy(analysis, original_height)
+
+        scene_duration = (end_time.get_frames() - start_time.get_frames()) / fps
+        needs_panning = strategy == 'TRACK' and scene_duration > 3
+
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
             'end_frame': end_time.get_frames(),
             'analysis': analysis,
             'strategy': strategy,
-            'target_box': target_box
+            'target_box': target_box,
+            'needs_panning': needs_panning
         })
     step_end_time = time.time()
     print(f"✅ Scene analysis complete in {step_end_time - step_start_time:.2f}s.")
@@ -210,6 +241,10 @@ def run_conversion(input_path, output_path):
     frame_number = 0
     current_scene_index = 0
     
+    pan_state = 'center'
+    last_pan_time = 0
+    last_crop_box = None
+
     with tqdm(total=total_frames, desc="Applying Plan", disable=True) as pbar:
         while cap.isOpened():
             ret, frame = cap.read()
@@ -219,13 +254,28 @@ def run_conversion(input_path, output_path):
             if current_scene_index < len(scenes_analysis) - 1 and \
                frame_number >= scenes_analysis[current_scene_index + 1]['start_frame']:
                 current_scene_index += 1
+                pan_state = 'center'
+                last_pan_time = 0
+                last_crop_box = None
 
             scene_data = scenes_analysis[current_scene_index]
             strategy = scene_data['strategy']
             target_box = scene_data['target_box']
 
             if strategy == 'TRACK':
-                crop_box = calculate_crop_box(target_box, original_width, original_height)
+                if scene_data['needs_panning']:
+                    scene_time = (frame_number - scene_data['start_frame']) / fps
+                    if scene_time > last_pan_time + 3:
+                        if pan_state == 'center':
+                            pan_state = 'right'
+                        elif pan_state == 'right':
+                            pan_state = 'left'
+                        else: # left
+                            pan_state = 'right'
+                        last_pan_time = scene_time
+
+                crop_box = calculate_panning_crop_box(target_box, pan_state, last_crop_box, original_width, original_height)
+                last_crop_box = crop_box
                 processed_frame = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
                 output_frame = cv2.resize(processed_frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
             else: # LETTERBOX
@@ -290,6 +340,275 @@ def run_conversion(input_path, output_path):
     print(f"\n🎉 All done! Final video saved to {final_output_video}")
     print(f"⏱️  Total execution time: {script_end_time - script_start_time:.2f} seconds.")
 
+    merge_audio_keep_original(video_path=final_output_video , audio_path='/Users/umeshyadav/Documents/test_audio.mp3',
+                           output_path='/Users/umeshyadav/Documents/test_a1.mp4')
+
+def _has_audio_track(video_path):
+    """Return True if the video contains an audio stream (uses ffprobe)."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
+        video_path
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return bool(proc.stdout.strip())
+
+def merge_audio_keep_original(video_path, audio_path, output_path):
+    """
+    Merge `audio_path` into `video_path` while keeping the video's original audio level unchanged,
+    and keeping the new audio at 10% volume.
+
+    Rules:
+      - If audio shorter than video -> loop it.
+      - If audio longer than video  -> trimmed to video duration.
+      - Original video audio unchanged; new audio reduced to 10% before mixing.
+    """
+    video_has_audio = _has_audio_track(video_path)
+
+    # Quote paths for shell safety
+    vq = shlex.quote(video_path)
+    aq = shlex.quote(audio_path)
+    outq = shlex.quote(output_path)
+
+    if video_has_audio:
+        # Use video as input 0 and loop external audio as input 1.
+        # Filter chain:
+        #  [1:a] -> volume=0.1, aresample -> [a1]
+        #  [0:a] -> aresample -> [a0]
+        #  [a0][a1] -> amix (inputs=2, duration=first so it follows original audio/video length) -> [mixed]
+        # Map 0:v and [mixed]
+        cmd = (
+            "ffmpeg -y "
+            f"-i {vq} "
+            f"-stream_loop -1 -i {aq} "
+            "-filter_complex "
+            "\"[1:a]volume=0.1,aresample=48000[a1];"
+            "[0:a]aresample=48000[a0];"
+            "[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[mix]\" "
+            "-map 0:v -map \"[mix]\" "
+            "-c:v copy -c:a aac -b:a 192k "
+            "-shortest "
+            f"{outq}"
+        )
+    else:
+        # No original audio -> just use external audio (looped, volume=0.1)
+        cmd = (
+            "ffmpeg -y "
+            f"-i {vq} "
+            f"-stream_loop -1 -i {aq} "
+            "-filter_complex "
+            "\"[1:a]volume=0.1,aresample=48000[a1]\" "
+            "-map 0:v -map \"[a1]\" "
+            "-c:v copy -c:a aac -b:a 192k "
+            "-shortest "
+            f"{outq}"
+        )
+
+    print("Running ffmpeg command:")
+    print(cmd)
+    subprocess.run(cmd, shell=True, check=True)
+
+def remove_audio(video_path, output_path):
+    """
+    Removes all audio streams from the input video.
+    Video is copied without re-encoding.
+    """
+    cmd = (
+        "ffmpeg -y "
+        f"-i {shlex.quote(video_path)} "
+        "-c:v copy -an "
+        f"{shlex.quote(output_path)}"
+    )
+
+    print("Running:", cmd)
+    subprocess.run(cmd, shell=True, check=True)
+
+def ffprobe_json(path):
+    """Return ffprobe JSON for the file."""
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
+        str(path)
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"ffprobe failed for {path}:\n{res.stderr}", file=sys.stderr)
+        sys.exit(res.returncode)
+    return json.loads(res.stdout)
+
+def get_video_stream_info(path):
+    """Return (width, height, duration_seconds) for the first video stream."""
+    info = ffprobe_json(path)
+    # find first video stream
+    streams = info.get("streams", [])
+    vstream = None
+    for s in streams:
+        if s.get("codec_type") == "video":
+            vstream = s
+            break
+    if not vstream:
+        print(f"No video stream found in {path}", file=sys.stderr)
+        sys.exit(1)
+
+    width = int(vstream.get("width"))
+    height = int(vstream.get("height"))
+
+    # duration: prefer format.duration then stream.duration
+    duration = None
+    fmt = info.get("format", {})
+    if fmt.get("duration"):
+        duration = float(fmt["duration"])
+    else:
+        # fallback to stream duration
+        duration = float(vstream.get("duration", 0.0))
+
+    if duration <= 0:
+        print(f"Could not determine duration for {path} (got {duration})", file=sys.stderr)
+        sys.exit(1)
+
+    return width, height, duration
+
+def build_ffmpeg_command(fg_path, bg_path, out_path, shrink_percent, fg_width, fg_height, duration, crf, preset):
+    """
+    Strategy:
+    - Use -stream_loop -1 for background input so it loops indefinitely (ffmpeg option must appear before -i).
+    - Limit output duration with -t <duration> so the looped background is trimmed to the foreground length.
+    - Filter graph:
+        [0:v] -> background (scale to fg resolution)
+        [1:v] -> foreground (scale width to shrink% of foreground width; height auto with -2)
+        overlay them with foreground centered
+    - Map video from filter output, map foreground audio (input index 1) if present.
+    """
+
+    shrink_factor = shrink_percent / 100.0
+
+    # Use numeric canvas size (fg_width x fg_height) for precise scaling of background
+    filter_complex = (
+        # note: input order in the command will be: bg (index 0, looped), fg (index 1)
+        # scale background to foreground canvas, ensure valid SAR
+        f"[0:v]scale={fg_width}:{fg_height},setsar=1[bgscaled];"
+        # scale foreground width to shrink% of its original width; -2 makes height even
+        f"[1:v]scale=iw*{shrink_factor}:-2[fgscaled];"
+        # overlay centered
+        "[bgscaled][fgscaled]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2:format=auto[outv]"
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        # loop background infinitely (will be trimmed by -t)
+        "-stream_loop", "-1",
+        "-i", str(bg_path),
+        "-i", str(fg_path),
+        "-filter_complex", filter_complex,
+        "-map", "[outv]",
+        # map foreground audio (input 1)
+        "-map", "1:a?",
+        "-c:v", "libx264",
+        "-crf", str(crf),
+        "-preset", preset,
+        "-c:a", "copy",
+        # limit output duration to foreground duration (avoid overrun if bg longer/looped)
+        "-t", f"{duration:.3f}",
+        "-movflags", "+faststart",
+        str(out_path)
+    ]
+
+    return cmd
+
+def run(cmd):
+    print("Running:\n", " ".join(shlex.quote(c) for c in cmd))
+    subprocess.run(cmd, check=True)
+
+def main():
+    parser = argparse.ArgumentParser(description="Overlay foreground (shrunken) on a looped/truncated background video.")
+    parser.add_argument("--foreground", "-f", required=True, help="Foreground video path (canvas source).")
+    parser.add_argument("--background", "-b", required=True, help="Background video path (will be looped/trimmed to match foreground).")
+    parser.add_argument("--output", "-o", required=True, help="Output path.")
+    parser.add_argument("--shrink", type=float, default=50.0, help="Shrink percent for foreground width (e.g., 50 => 50%% width). Default: 50")
+    parser.add_argument("--crf", type=int, default=18, help="CRF for libx264 (lower => higher quality). Default: 18")
+    parser.add_argument("--preset", type=str, default="medium", help="x264 preset (ultrafast, fast, medium, slow). Default: medium")
+    args = parser.parse_args()
+
+    fg_path = Path(args.foreground)
+    bg_path = Path(args.background)
+    out_path = Path(args.output)
+
+    # basic checks
+    if not fg_path.exists():
+        print(f"Foreground not found: {fg_path}", file=sys.stderr)
+        sys.exit(1)
+    if not bg_path.exists():
+        print(f"Background not found: {bg_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # check_tool("ffmpeg")
+    # check_tool("ffprobe")
+
+    # gather foreground info (canvas dims + duration)
+    fg_w, fg_h, fg_duration = get_video_stream_info(fg_path)
+    print(f"Foreground resolution: {fg_w}x{fg_h}, duration: {fg_duration:.3f} s")
+
+    # Build and run ffmpeg command
+    cmd = build_ffmpeg_command(
+        fg_path=fg_path,
+        bg_path=bg_path,
+        out_path=out_path,
+        shrink_percent=args.shrink,
+        fg_width=fg_w,
+        fg_height=fg_h,
+        duration=fg_duration,
+        crf=args.crf,
+        preset=args.preset
+    )
+
+    run(cmd)
+    print(f"Done — output written to: {out_path}")
+
+def test_main(input_path, output_path):
+    if not Path(input_path).exists():
+        print(f"Input file does not exist: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    fg_w, fg_h, fg_duration = get_video_stream_info(input_path)
+    print(f"Foreground resolution: {fg_w}x{fg_h}, duration: {fg_duration:.3f} s")
+
+    # Build and run ffmpeg command
+    cmd = build_ffmpeg_command(
+        fg_path=input_path,
+        bg_path='/Users/umeshyadav/Downloads/bg.mp4',
+        out_path=output_path,
+        shrink_percent=50,
+        fg_width=fg_w,
+        fg_height=fg_h,
+        duration=fg_duration,
+        crf=18,
+        preset='fast'
+    )
+
+    run(cmd)
+    print(f"Finished. Output written to: {output_path}")
+
+def test2():
+    cmd = build_ffmpeg_command(
+        fg_path=fg_path,
+        bg_path=bg_path,
+        out_path=out_path,
+        shrink_percent=args.shrink,
+        fg_width=fg_w,
+        fg_height=fg_h,
+        duration=fg_duration,
+        crf=args.crf,
+        preset=args.preset
+    )
+
+    run(cmd)
+
 if __name__ == '__main__':
     # parser = argparse.ArgumentParser(description="Smartly crops a horizontal video into a vertical one.")
     # parser.add_argument('-i', '--input', type=str, required=True, help="Path to the input video file.")
@@ -298,4 +617,9 @@ if __name__ == '__main__':
     #
     # input_v = args.input
     # final_output = args.output
-    run_conversion('/Users/umeshyadav/Downloads/test.mp4', '/Users/umeshyadav/Downloads/test_1.mp4')
+    # run_conversion('/Users/umeshyadav/Documents/test.mp4', '/Users/umeshyadav/Documents/test_1.mp4')
+    merge_audio_keep_original(video_path='/Users/umeshyadav/Documents/test.mp4', audio_path='/Users/umeshyadav/Documents/test_audio.mp3',
+                           output_path='/Users/umeshyadav/Documents/test_a1.mp4')
+    test_main('/Users/umeshyadav/Documents/test_a1.mp4', '/Users/umeshyadav/Documents/test_a2_3h.mp4')
+    # remove_audio('/Users/umeshyadav/Documents/test_a1.mp4', '/Users/umeshyadav/Documents/test_a2.mp4')
+    # run_conversion('/Users/umeshyadav/Documents/test.mp4', '/Users/umeshyadav/Documents/test_1.mp4')
