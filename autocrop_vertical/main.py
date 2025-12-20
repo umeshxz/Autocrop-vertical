@@ -1,15 +1,13 @@
-import time
-import cv2
-import scenedetect
+import os
 import subprocess
-import argparse
+import time
+
+import cv2
+import numpy as np
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
-from ultralytics import YOLO
-import torch
-import os
-import numpy as np
 from tqdm import tqdm
+from ultralytics import YOLO
 
 # --- Constants ---
 ASPECT_RATIO = 10 / 16
@@ -90,7 +88,7 @@ def get_enclosing_box(boxes):
     max_y = max(box[3] for box in boxes)
     return [min_x, min_y, max_x, max_y]
 
-def decide_cropping_strategy(scene_analysis, frame_height):
+def decide_cropping_strategy(scene_analysis, frame_height, aspect_ratio=ASPECT_RATIO):
     num_people = len(scene_analysis)
     if num_people == 0:
         return 'LETTERBOX', None
@@ -100,16 +98,16 @@ def decide_cropping_strategy(scene_analysis, frame_height):
     person_boxes = [obj['person_box'] for obj in scene_analysis]
     group_box = get_enclosing_box(person_boxes)
     group_width = group_box[2] - group_box[0]
-    max_width_for_crop = frame_height * ASPECT_RATIO
+    max_width_for_crop = frame_height * aspect_ratio
     if group_width < max_width_for_crop:
         return 'TRACK', group_box
     else:
         return 'LETTERBOX', None
 
-def calculate_crop_box(target_box, frame_width, frame_height):
+def calculate_crop_box(target_box, frame_width, frame_height, aspect_ratio=ASPECT_RATIO):
     target_center_x = (target_box[0] + target_box[2]) / 2
     crop_height = frame_height
-    crop_width = int(crop_height * ASPECT_RATIO)
+    crop_width = int(crop_height * aspect_ratio)
     x1 = int(target_center_x - crop_width / 2)
     y1 = 0
     x2 = int(target_center_x + crop_width / 2)
@@ -131,7 +129,7 @@ def get_video_resolution(video_path):
     cap.release()
     return width, height
 
-def run_conversion(input_path, output_path):
+def run_conversion(input_path, output_path, aspect_ratio=ASPECT_RATIO):
     script_start_time = time.time()
 
     input_video = input_path
@@ -166,7 +164,7 @@ def run_conversion(input_path, output_path):
     original_width, original_height = get_video_resolution(input_video)
     
     OUTPUT_HEIGHT = original_height
-    OUTPUT_WIDTH = int(OUTPUT_HEIGHT * ASPECT_RATIO)
+    OUTPUT_WIDTH = int(OUTPUT_HEIGHT * aspect_ratio)
     if OUTPUT_WIDTH % 2 != 0:
         OUTPUT_WIDTH += 1
 
