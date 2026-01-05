@@ -155,9 +155,8 @@ def run_conversion(input_path, output_path, aspect_ratio=ASPECT_RATIO):
         exit()
     
     print(f"✅ Found {len(scenes)} scenes in {step_end_time - step_start_time:.2f}s. Here is the breakdown:")
-    for i, (start, end) in enumerate(scenes):
-        print(f"  - Scene {i+1}: {start.get_timecode()} -> {end.get_timecode()}")
-
+    # for i, (start, end) in enumerate(scenes):
+    #     print(f"  - Scene {i+1}: {start.get_timecode()} -> {end.get_timecode()}")
 
     print("\n🧠 Step 2: Analyzing scene content and determining strategy...")
     step_start_time = time.time()
