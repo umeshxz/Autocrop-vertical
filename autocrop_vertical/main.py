@@ -1,4 +1,7 @@
+import argparse
 import os
+import re
+import shutil
 import subprocess
 import time
 
@@ -12,6 +15,7 @@ from ultralytics import YOLO
 # --- Constants ---
 # ASPECT_RATIO = 10 / 16
 
+# Load the YOLO model once
 # Load the YOLO model once
 model = YOLO('yolov8n.pt')
 
@@ -189,72 +193,161 @@ def run_conversion(input_path, output_path, aspect_ratio):
     print(f"✅ Scene analysis complete in {step_end_time - step_start_time:.2f}s.")
 
     print("\n📋 Step 3: Generated Processing Plan")
-    # for i, scene_data in enumerate(scenes_analysis):
-    #     num_people = len(scene_data['analysis'])
-    #     strategy = scene_data['strategy']
-    #     start_time = scenes[i][0].get_timecode()
-    #     end_time = scenes[i][1].get_timecode()
-    # print(f"  - Scene {i+1} ({start_time} -> {end_time}): Found {num_people} person(s). Strategy: {strategy}")
+    
+    # Group scenes into chunks with same strategy
+    chunks = []
+    if not scenes_analysis:
+        return
 
-    print("\n✂️ Step 4: Processing video frames...")
+    current_chunk = {
+        'strategy': scenes_analysis[0]['strategy'],
+        'scenes': [scenes_analysis[0]]
+    }
+    
+    for i in range(1, len(scenes_analysis)):
+        scene = scenes_analysis[i]
+        if scene['strategy'] == current_chunk['strategy']:
+            current_chunk['scenes'].append(scene)
+        else:
+            chunks.append(current_chunk)
+            current_chunk = {
+                'strategy': scene['strategy'],
+                'scenes': [scene]
+            }
+    chunks.append(current_chunk)
+    
+    print(f"✅ Grouped {len(scenes_analysis)} scenes into {len(chunks)} processing chunks.")
+
+    print("\n✂️ Step 4: Processing video segments (FFmpeg Native)...")
     step_start_time = time.time()
+    
+    chunk_files = []
+    temp_dir = f"{base_name}_segments"
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
+        
+    for i, chunk in enumerate(tqdm(chunks, desc="Rendering Chunks")):
+        chunk_strategy = chunk['strategy']
+        chunk_output = os.path.join(temp_dir, f"chunk_{i:04d}.mp4")
+        chunk_files.append(chunk_output)
+        
+        # Calculate start and end for the whole chunk
+        # Note: We need accurate frame trimming.
+        # But for 'crop' expression, we need relative frames from 0.
+        
+        # Construct specific filter command
+        # 1. Trim the input to the chunk duration
+        # 2. Apply filter (Dynamic Crop or Letterbox)
+        
+        chunk_start_frame = chunk['scenes'][0]['start_frame']
+        chunk_end_frame = chunk['scenes'][-1]['end_frame']
+        
+        # FFmpeg 'select' or 'trim' uses seconds usually for -ss/to, or frames for filter
+        # Ideally using -ss before input is fast, but precise frame matching can be tricky with GOP.
+        # We will use -ss (fast seek) and re-encode.
+        
+        # Calculate time (approximation from frames? No, use the stored timecodes if possible, 
+        # but here we have frames. Let's use start_frame/fps)
+        start_sec = chunk_start_frame / fps
+        end_sec = chunk_end_frame / fps
+        duration_sec = end_sec - start_sec
+        
+        vf_filters = []
+        
+        if chunk_strategy == 'LETTERBOX':
+            # Scale to fit width, then pad height
+            # scale=w=OUTPUT_WIDTH:h=-1:flags=lanczos,pad=w=OUTPUT_WIDTH:h=OUTPUT_HEIGHT:x=0:y=(oh-ih)/2
+            vf_filters.append(f"scale={OUTPUT_WIDTH}:-2") # -2 ensures even dim
+            vf_filters.append(f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black")
+            
+        elif chunk_strategy == 'TRACK':
+            # Dynamic Crop
+            # x = if(between(n, 0, len1), x1, if(between(n, len1, len2), x2, ...))
+            # Note: 'n' in the filter starts at 0 for the trimmed segment.
+            
+            # We need to build the IF chain.
+            expr_parts = []
+            
+            # Calculate crop boxes and relative durations
+            rel_start = 0
+            
+            # Use 'default' x as the last one to be safe
+            default_x = 0
+            
+            for scene in chunk['scenes']:
+                s_len = scene['end_frame'] - scene['start_frame']
+                target_box = scene['target_box']
+                # Recalculate crop box for this specific scene target
+                # (function logic copied/inlined to ensure accessing variables)
+                
+                # Logic from calculate_crop_box:
+                target_center_x = (target_box[0] + target_box[2]) / 2
+                crop_w = int(original_height * aspect_ratio)
+                x1 = int(target_center_x - crop_w / 2)
+                # Bounds check
+                if x1 < 0: x1 = 0
+                if x1 + crop_w > original_width: x1 = original_width - crop_w
+                
+                # For this frame range [rel_start, rel_start + s_len]
+                # We want x to be x1
+                # expr: between(n, start, end)
+                # Note: 'between' is inclusive.
+                expr_parts.append(f"between(n,{rel_start},{rel_start + s_len})*{x1}")
+                
+                rel_start += s_len
+                default_x = x1
+            
+            # Refined expression: Summing them works if ranges don't overlap.
+            # "between(n,A,B)*VAL + between(n,B,C)*VAL2..."
+            # Since 'n' increases, only one term is 1 (true) at a time.
+            x_expr = "+".join(expr_parts)
+            if not x_expr: x_expr = "0"
+            
+            vf_filters.append(f"crop=w={OUTPUT_WIDTH}:h={OUTPUT_HEIGHT}:x='{x_expr}':y=0")
+            
+        vf_string = ",".join(vf_filters)
+        
+        # Execute FFmpeg for this chunk
+        cmd = [
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-ss', f"{start_sec:.3f}",
+            '-t', f"{duration_sec:.3f}", # -t is duration
+            '-i', input_video,
+            '-vf', vf_string,
+            '-c:v', 'h264_videotoolbox', '-b:v', '5000k', # Hardware encoder on Mac
+            '-an', # No audio in segments, we merge original audio later
+            chunk_output
+        ]
+        
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Chunk rendering failed: {e.stderr.decode()}")
+            # Critical failure
+            exit()
 
-    command = [
-        'ffmpeg', '-loglevel', 'info', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
-        '-r', str(fps), '-i', '-', '-c:v', 'libx264',
-        '-preset', 'fast', '-crf', '23', '-an', temp_video_output
+    # Concat chunks
+    print("🔗 Concatenating segments...")
+    concat_list_path = f"{base_name}_concat_list.txt"
+    with open(concat_list_path, 'w') as f:
+        for p in chunk_files:
+            abs_p = os.path.abspath(p)
+            f.write(f"file '{abs_p}'\n")
+            
+    concat_cmd = [
+        'ffmpeg', '-y', '-loglevel', 'error',
+        '-f', 'concat', '-safe', '0',
+        '-i', concat_list_path,
+        '-c', 'copy',
+        temp_video_output
     ]
-
-    ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-    cap = cv2.VideoCapture(input_video)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    frame_number = 0
-    current_scene_index = 0
-
-    with tqdm(total=total_frames, desc="Applying Plan", disable=True) as pbar:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            if current_scene_index < len(scenes_analysis) - 1 and \
-                    frame_number >= scenes_analysis[current_scene_index + 1]['start_frame']:
-                current_scene_index += 1
-
-            scene_data = scenes_analysis[current_scene_index]
-            strategy = scene_data['strategy']
-            target_box = scene_data['target_box']
-
-            # print(strategy)
-            if strategy == 'TRACK':
-                crop_box = calculate_crop_box(target_box, original_width, original_height, aspect_ratio)
-                processed_frame = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
-                output_frame = cv2.resize(processed_frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
-            else:  # LETTERBOX
-                scale_factor = OUTPUT_WIDTH / original_width
-                scaled_height = int(original_height * scale_factor)
-                scaled_frame = cv2.resize(frame, (OUTPUT_WIDTH, scaled_height))
-
-                output_frame = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
-                y_offset = (OUTPUT_HEIGHT - scaled_height) // 2
-                output_frame[y_offset:y_offset + scaled_height, :] = scaled_frame
-
-            ffmpeg_process.stdin.write(output_frame.tobytes())
-            frame_number += 1
-            pbar.update(1)
-
-    ffmpeg_process.stdin.close()
-    stderr_output = ffmpeg_process.stderr.read().decode()
-    ffmpeg_process.wait()
-    cap.release()
-
-    if ffmpeg_process.returncode != 0:
-        print("\n❌ FFmpeg frame processing failed.")
-        print("Stderr:", stderr_output)
-        exit()
+    subprocess.run(concat_cmd, check=True)
+    
+    # Cleanup Segments
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    if os.path.exists(concat_list_path):
+        os.remove(concat_list_path)
     step_end_time = time.time()
     print(f"✅ Video processing complete in {step_end_time - step_start_time:.2f}s.")
 
@@ -295,7 +388,7 @@ def run_conversion(input_path, output_path, aspect_ratio):
     print(f"\n🎉 All done! Final video saved to {final_output_video}")
     print(f"⏱️  Total execution time: {script_end_time - script_start_time:.2f} seconds.")
 
-if __name__ == '__main__':
+# if __name__ == '__main__':
     # parser = argparse.ArgumentParser(description="Smartly crops a horizontal video into a vertical one.")
     # parser.add_argument('-i', '--input', type=str, required=True, help="Path to the input video file.")
     # parser.add_argument('-o', '--output', type=str, required=True, help="Path to the output video file.")
